@@ -1,0 +1,4 @@
+.zig-cache/
+zig-out/
+.tools/
+models/llama3-small-Q3_K_M.gguf
