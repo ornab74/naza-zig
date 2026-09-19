@@ -2298,7 +2298,10 @@ test "prompt builder llama3 framing" {
 // ============================================================================
 
 pub const AeadBox = struct {
-    const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+    // Original Naza uses AES-256-GCM for authenticated records. Keep the
+    // record format stable while removing the unrelated ChaCha20-Poly1305
+    // implementation from the application surface.
+    const Aead = std.crypto.aead.aes_gcm.Aes256Gcm;
     pub const key_length = Aead.key_length;
     pub const nonce_length = Aead.nonce_length;
     pub const tag_length = Aead.tag_length;
@@ -2818,6 +2821,20 @@ test "sealed record roundtrip" {
 
     blob[blob.len - 1] ^= 1;
     try std.testing.expectError(error.AuthenticationFailed, SealedRecord.openAlloc(allocator, &key, "aad", blob));
+}
+
+test "AES-256-GCM rejects modified ciphertext and AAD" {
+    const key = [_]u8{0x11} ** 32;
+    const nonce = [_]u8{0x22} ** AeadBox.nonce_length;
+    const plain = "naza authenticated record";
+    var cipher: [plain.len]u8 = undefined;
+    var tag: [AeadBox.tag_length]u8 = undefined;
+    try AeadBox.seal(&cipher, &tag, plain, "naza/aad/v1", &nonce, &key);
+    var recovered: [plain.len]u8 = undefined;
+    try AeadBox.open(&recovered, &cipher, &tag, "naza/aad/v1", &nonce, &key);
+    try std.testing.expectEqualSlices(u8, plain, &recovered);
+    cipher[0] ^= 1;
+    try std.testing.expectError(error.AuthenticationFailed, AeadBox.open(&recovered, &cipher, &tag, "naza/aad/v1", &nonce, &key));
 }
 
 test "file mac changes with payload" {
@@ -6058,7 +6075,7 @@ pub const HashTree = struct {
 pub const KeySchedule = struct {
     pub fn derive(master: []const u8, salt: []const u8, label: []const u8, context: []const u8, out: []u8) !void {
         if (label.len == 0 or label.len > 255 or context.len > 65535) return error.InvalidLabel;
-        const prk = hkdfExtractSha256(salt, master);
+        const prk = hkdfExtractSha512(salt, master);
         var info = std.ArrayList(u8).empty;
         defer info.deinit(std.heap.page_allocator);
         try info.appendSlice(std.heap.page_allocator, "NAZA-ZIG-v1");
@@ -6068,7 +6085,7 @@ pub const KeySchedule = struct {
         try writeU16Le(&lenbuf, @intCast(context.len));
         try info.appendSlice(std.heap.page_allocator, &lenbuf);
         try info.appendSlice(std.heap.page_allocator, context);
-        try hkdfExpandSha256(&prk, info.items, out);
+        try hkdfExpandSha512(&prk, info.items, out);
     }
 };
 
@@ -6195,47 +6212,8 @@ pub const PqcAlgorithm = struct {
 };
 
 pub const pqc_algorithms = [_]PqcAlgorithm{
-    .{ .id = "ML-KEM-512", .kind = .kem, .basis = .lattice, .status = .nist_standard, .implementation = .implemented_unverified },
-    .{ .id = "ML-KEM-768", .kind = .kem, .basis = .lattice, .status = .nist_standard, .implementation = .implemented_unverified },
     .{ .id = "ML-KEM-1024", .kind = .kem, .basis = .lattice, .status = .nist_standard, .implementation = .implemented_unverified },
-    .{ .id = "HQC-128", .kind = .kem, .basis = .code, .status = .nist_selected, .implementation = .partial },
-    .{ .id = "HQC-192", .kind = .kem, .basis = .code, .status = .nist_selected, .implementation = .partial },
     .{ .id = "HQC-256", .kind = .kem, .basis = .code, .status = .nist_selected, .implementation = .partial },
-    .{ .id = "sntrup761", .kind = .kem, .basis = .lattice, .status = .ietf_standard, .implementation = .catalog_only },
-    .{ .id = "ML-DSA-44", .kind = .signature, .basis = .lattice, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "ML-DSA-65", .kind = .signature, .basis = .lattice, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "ML-DSA-87", .kind = .signature, .basis = .lattice, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHA2-128s", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHA2-128f", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHA2-192s", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHA2-192f", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHA2-256s", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHA2-256f", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHAKE-128s", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHAKE-128f", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHAKE-192s", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHAKE-192f", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHAKE-256s", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "SLH-DSA-SHAKE-256f", .kind = .signature, .basis = .hash, .status = .nist_standard, .implementation = .partial },
-    .{ .id = "FN-DSA-512", .kind = .signature, .basis = .lattice, .status = .nist_selected, .implementation = .partial },
-    .{ .id = "FN-DSA-1024", .kind = .signature, .basis = .lattice, .status = .nist_selected, .implementation = .partial },
-    .{ .id = "XMSS", .kind = .stateful_signature, .basis = .hash, .status = .ietf_standard, .implementation = .catalog_only },
-    .{ .id = "LMS/HSS", .kind = .stateful_signature, .basis = .hash, .status = .ietf_standard, .implementation = .catalog_only },
-    .{ .id = "NTRU+", .kind = .kem, .basis = .lattice, .status = .national_standard, .implementation = .catalog_only },
-    .{ .id = "SMAUG-T", .kind = .kem, .basis = .lattice, .status = .national_standard, .implementation = .catalog_only },
-    .{ .id = "AIMer", .kind = .signature, .basis = .mpc_in_the_head, .status = .national_standard, .implementation = .catalog_only },
-    .{ .id = "HAETAE", .kind = .signature, .basis = .lattice, .status = .national_standard, .implementation = .catalog_only },
-    .{ .id = "BIKE", .kind = .kem, .basis = .code, .status = .candidate, .implementation = .catalog_only },
-    .{ .id = "Classic-McEliece", .kind = .kem, .basis = .code, .status = .candidate, .implementation = .catalog_only },
-    .{ .id = "FrodoKEM", .kind = .kem, .basis = .lattice, .status = .candidate, .implementation = .catalog_only },
-    .{ .id = "NTRU", .kind = .kem, .basis = .lattice, .status = .candidate, .implementation = .catalog_only },
-    .{ .id = "MAYO", .kind = .signature, .basis = .multivariate, .status = .candidate, .implementation = .catalog_only },
-    .{ .id = "UOV", .kind = .signature, .basis = .multivariate, .status = .candidate, .implementation = .catalog_only },
-    .{ .id = "CROSS", .kind = .signature, .basis = .code, .status = .candidate, .implementation = .catalog_only },
-    .{ .id = "FAEST", .kind = .signature, .basis = .mpc_in_the_head, .status = .candidate, .implementation = .catalog_only },
-    .{ .id = "Picnic", .kind = .signature, .basis = .mpc_in_the_head, .status = .research, .implementation = .catalog_only },
-    .{ .id = "SIKE", .kind = .kem, .basis = .isogeny, .status = .deprecated_broken, .implementation = .catalog_only },
-    .{ .id = "Rainbow", .kind = .signature, .basis = .multivariate, .status = .deprecated_broken, .implementation = .catalog_only },
     .{ .id = "ML-KEM-1024+HQC-256", .kind = .hybrid, .basis = .mixed, .status = .research, .implementation = .catalog_only },
     .{ .id = "ML-KEM-1024+HQC-256+X25519", .kind = .hybrid, .basis = .mixed, .status = .research, .implementation = .catalog_only },
 };
@@ -6920,10 +6898,10 @@ test "ML-KEM negacyclic multiply" {
     try std.testing.expectEqual(@as(i16, MlKem.q - 1), c[0]);
 }
 
-test "PQC catalog retains broken algorithms as disabled knowledge" {
-    const sike = findPqc("SIKE") orelse return error.MissingCatalogItem;
-    try std.testing.expectEqual(PqcStatus.deprecated_broken, sike.status);
-    try std.testing.expect(!pqcUsable("SIKE"));
+test "PQC catalog exposes only the original Naza families" {
+    try std.testing.expect(findPqc("SIKE") == null);
+    try std.testing.expect(findPqc("ML-KEM-1024") != null);
+    try std.testing.expect(findPqc("HQC-256") != null);
 }
 
 // ============================================================================
@@ -62924,7 +62902,7 @@ test "realized catalog separates callable from catalog-only" {
     try std.testing.expect(!pqcCallable("ML-DSA-87"));
     try std.testing.expect(!pqcCallable("Classic-McEliece"));
     try std.testing.expect(!pqcUsable("ML-KEM-1024"));
-    try std.testing.expectEqual(PqcImplementation.catalog_only, findPqc("Classic-McEliece").?.implementation);
+    try std.testing.expect(findPqc("Classic-McEliece") == null);
 }
 
 test "coherence guard holds unstable transition briefly" {
