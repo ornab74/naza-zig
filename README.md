@@ -1,55 +1,167 @@
-# NAZA Pure-Zig Monolith — Realized Implementation Pass
+# NAZA Pure-Zig
 
-This checkpoint is a single-source-file Zig implementation targetting Zig 0.15.2. It does not use `@cImport`, libc, C sources, Python, llama.cpp, liboqs, OpenSSL, or system-library crypto linkage.
+Pure-Zig NAZA terminal UI with secure GGUF handling, crypto utilities, and fast road/food evidence scans.
 
-The application source is `src/naza_all.zig`.
+## What was implemented
 
-## What changed in this pass
-
-The ML-KEM-512/768/1024 research implementation is callable but remains unverified against official vectors. The ML-DSA arithmetic and packing code is retained for repair work, but its public facade now fails closed because audit testing proved that its signer output is not accepted by its verifier.
-
-The implementation catalog now uses explicit states:
-
-- `catalog_only`: named for discovery, but no callable implementation exists.
-- `partial`: meaningful algorithm components exist, but the complete standardized primitive is not implemented.
-- `implemented_unverified`: a complete callable API path exists, but official vectors have not been run in this environment.
-- `implemented`: implementation is complete and locally validated.
-- `verified_vectors`: official vector validation has passed.
-
-ML-KEM is `implemented_unverified`; it passes local round-trip and tamper-rejection tests but has not passed official FIPS 203 vectors. ML-DSA, HQC, FN-DSA, and SLH-DSA are `partial`. ML-DSA-44/65/87 are deliberately non-callable until sign/verify interoperability and official vectors pass. Other catalog entries remain `catalog_only`; SIKE and Rainbow remain marked deprecated/broken.
-
-## Pinned GGUF
-
-The source retains the exact pinned model:
-
-- Repository: `https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/`
-- File: `llama3-small-Q3_K_M.gguf`
-- SHA-256: `8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa`
+- Boxed numbered terminal UI
+- Road-condition scanner
+- Food/water scanner
+- Fast pure-Zig evidence scanning
+- Low/Medium/High risk extraction
+- Secure HTTPS GGUF downloader
+- SHA-256 model verification
+- GGUF inspection
+- SHA3-256 and SHAKE256 commands
+- ML-KEM and crypto self-tests
+- Native CPU optimizations
+- Quantized matrix worker pool
+- Fused Q3_K dot-product kernel
 
 ## Build
 
-This workspace contains a locally installed Zig 0.15.2 under `.tools/`, excluded from Git. Its archive was downloaded from `ziglang.org`, checked for path traversal, and verified against the official SHA-256 `02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239` before extraction.
+```bash
+ZIG_GLOBAL_CACHE_DIR=/tmp/naza-zig-global-cache \
+.tools/zig-0.15.2/zig build
+```
+
+## Test
+
+```bash
+ZIG_GLOBAL_CACHE_DIR=/tmp/naza-zig-global-cache \
+.tools/zig-0.15.2/zig build test
+```
+
+## Format check
+
+```bash
+.tools/zig-0.15.2/zig fmt --check build.zig src/naza_all.zig
+```
+
+## Run the TUI
+
+```bash
+ZIG_GLOBAL_CACHE_DIR=/tmp/naza-zig-global-cache \
+.tools/zig-0.15.2/zig build run -- tui
+```
+
+Or:
+
+```bash
+./zig-out/bin/naza-zig tui
+```
+
+Select:
 
 ```text
-.tools/zig-0.15.2/zig build
-.tools/zig-0.15.2/zig build test
-.tools/zig-0.15.2/zig build run -- selftest
+3) Road Scanner
 ```
+
+Enter one location or route. Press Enter for the remaining fields to use defaults.
+
+The default scanner is fast, pure-Zig evidence processing. It does not access GPS, live traffic, weather, satellites, or sensors.
+
+The scanner returns the first standalone:
+
+```text
+Low
+Medium
+High
+```
+
+If no valid label is found, it returns `Medium`.
 
 ## Secure model download
 
-The downloader accepts only HTTPS URLs on the pinned Hugging Face host allowlist, manually validates every redirect, refuses userinfo and non-443 ports, disables content encoding, enforces an 8 GiB streaming limit, writes a mode-0600 exclusive staging file, verifies the pinned SHA-256 in constant time, and publishes without overwriting an existing destination.
+Pinned model:
 
 ```text
-.tools/zig-0.15.2/zig build run -- download models/llama3-small-Q3_K_M.gguf
+llama3-small-Q3_K_M.gguf
 ```
 
-The parent directory must already exist. Existing destinations are never overwritten.
+SHA-256:
 
-## Terminal UI
+```text
+8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa
+```
 
-Run `zig build run` from a real terminal to open the boxed, numbered NAZA TUI. The same interface can be selected explicitly with `zig build run -- tui`. It includes Model Manager, chat-prompt preview, road and food/water evidence prompts, GGUF inspection, the PQC catalog, hash tools, and self-test. The UI does not claim to have sensors or a loaded model when those runtime inputs are unavailable.
+Download:
 
-The suite includes SHA-3/SHAKE known-answer tests, RFC HMAC/HKDF vectors, authenticated-encryption tamper rejection, ML-KEM round-trip and implicit-rejection checks, downloader policy checks, and integer-overflow checks. These tests are not substitutes for official ML-KEM vectors or independent cryptographic review.
+```bash
+mkdir -p models
 
-The repository also includes a GitHub Actions workflow that runs formatting checks, the build, the full test suite, and the runtime self-test with Zig 0.15.2.
+ZIG_GLOBAL_CACHE_DIR=/tmp/naza-zig-global-cache \
+.tools/zig-0.15.2/zig build run -- \
+download models/llama3-small-Q3_K_M.gguf
+```
+
+Verify:
+
+```bash
+ZIG_GLOBAL_CACHE_DIR=/tmp/naza-zig-global-cache \
+.tools/zig-0.15.2/zig build run -- \
+verify models/llama3-small-Q3_K_M.gguf
+```
+
+The downloader:
+
+- Requires HTTPS
+- Validates redirects
+- Restricts the model host
+- Displays download progress
+- Uses a mode-0600 staging file
+- Verifies SHA-256 before publishing
+- Never overwrites an existing destination
+
+## Optional full GGUF scan
+
+The full pure-Zig GGUF inference path is slower and disabled by default.
+
+```bash
+NAZA_ENABLE_MODEL_SCAN=1 \
+ZIG_GLOBAL_CACHE_DIR=/tmp/naza-zig-global-cache \
+.tools/zig-0.15.2/zig build run -- tui
+```
+
+## Other commands
+
+Show model information:
+
+```bash
+.tools/zig-0.15.2/zig build run -- model
+```
+
+Inspect GGUF metadata:
+
+```bash
+.tools/zig-0.15.2/zig build run -- \
+gguf models/llama3-small-Q3_K_M.gguf
+```
+
+List PQC algorithms:
+
+```bash
+.tools/zig-0.15.2/zig build run -- pqc
+```
+
+SHA3-256:
+
+```bash
+.tools/zig-0.15.2/zig build run -- sha3 "hello"
+```
+
+SHAKE256:
+
+```bash
+.tools/zig-0.15.2/zig build run -- shake "hello" 32
+```
+
+Run self-test:
+
+```bash
+.tools/zig-0.15.2/zig build run -- selftest
+```
+
+## Disclaimer
+
+This is experimental decision-support software. It does not provide live road conditions or prove real-world safety. Verify results independently.
