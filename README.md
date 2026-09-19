@@ -25,6 +25,45 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/naza-zig-global-cache \
 .tools/zig-0.15.2/zig build
 ```
 
+## Android / Termux installation
+
+Install Termux and the matching Termux:API companion from the same trusted
+distribution. In Termux, run:
+
+```sh
+pkg update -y
+pkg install -y git
+git clone https://github.com/ornab74/naza-zig.git
+cd naza-zig/android/termux
+chmod +x install.sh unlock-and-run.sh
+bash install.sh
+```
+
+The installer:
+
+- installs the signed Termux Zig package and Android build tools;
+- creates or reuses the `naza-zig-unlock` Android Keystore alias;
+- requires a 2048-bit RSA key with user authentication and secure-hardware
+  enforcement;
+- pins the checkout to the requested Git ref and builds a `ReleaseSafe`
+  `aarch64-linux-android` binary;
+- stores the binary and local state under mode-0700 directories; and
+- launches only after a fresh Keystore-backed nonce-signing operation.
+
+The installer does not use `termux-fingerprint`. The Android Keystore signing
+operation is the only unlock operation. If the device or Termux:API reports
+software-only key enforcement, installation stops instead of silently
+weakening the protection.
+
+After installation, reopen Termux and run:
+
+```sh
+naza
+```
+
+For the detailed Android scripts and security notes, see
+[`android/termux/README.md`](android/termux/README.md).
+
 ## Test
 
 ```bash
@@ -142,18 +181,6 @@ List PQC algorithms:
 
 ```bash
 .tools/zig-0.15.2/zig build run -- pqc
-```
-
-SHA3-256:
-
-```bash
-.tools/zig-0.15.2/zig build run -- sha3 "hello"
-```
-
-SHAKE256:
-
-```bash
-.tools/zig-0.15.2/zig build run -- shake "hello" 32
 ```
 
 Run self-test:

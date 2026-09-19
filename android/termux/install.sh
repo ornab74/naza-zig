@@ -17,7 +17,6 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 pkg update -y
 pkg install -y git curl coreutils termux-api clang lld make zig
 command -v termux-keystore >/dev/null || fail "Termux:API keystore unavailable"
-command -v termux-fingerprint >/dev/null || fail "Termux:API fingerprint unavailable"
 
 printf '%s\n' 'Checking Android keystore...'
 if ! termux-keystore list 2>/dev/null | grep -Fq "$KEY_ALIAS"; then

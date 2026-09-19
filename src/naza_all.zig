@@ -2000,6 +2000,8 @@ pub const AtomicStorage = struct {
         var f = try std.fs.cwd().openFile(path, .{});
         defer f.close();
         const st = try f.stat();
+        if (st.kind != .file) return error.NotRegularFile;
+        if (st.mode & 0o077 != 0) return error.InsecureFilePermissions;
         if (st.size > maximum) return error.FileTooLarge;
         const n: usize = @intCast(st.size);
         const out = try allocator.alloc(u8, n);
@@ -2013,13 +2015,13 @@ pub const AtomicStorage = struct {
     pub fn writeAtomic(path: []const u8, data: []const u8) !void {
         if (data.len > max_file) return error.FileTooLarge;
         var name_buf: [1024]u8 = undefined;
-        if (path.len + 16 > name_buf.len) return error.PathTooLong;
+        if (path.len + 32 > name_buf.len) return error.PathTooLong;
         @memcpy(name_buf[0..path.len], path);
-        const suffix = ".naza.tmp";
-        @memcpy(name_buf[path.len .. path.len + suffix.len], suffix);
+        const nonce = std.crypto.random.int(u64);
+        const suffix = try std.fmt.bufPrint(name_buf[path.len..], ".naza.tmp-{x}", .{nonce});
         const tmp = name_buf[0 .. path.len + suffix.len];
         {
-            var f = try std.fs.cwd().createFile(tmp, .{ .truncate = true });
+            var f = try std.fs.cwd().createFile(tmp, .{ .truncate = false, .exclusive = true, .mode = 0o600 });
             errdefer std.fs.cwd().deleteFile(tmp) catch {};
             try f.writeAll(data);
             try f.sync();
@@ -2139,6 +2141,28 @@ pub const SpookyCombiner = struct {
         return out;
     }
 };
+
+test "Spooky combiner binds transcript and lane order" {
+    const envelope_id = [_]u8{0x01} ** 32;
+    const pk_a = [_]u8{0x02} ** 16;
+    const ct_a = [_]u8{0x03} ** 16;
+    const pk_b = [_]u8{0x04} ** 16;
+    const ct_b = [_]u8{0x05} ** 16;
+    const transcript = SpookyCombiner.transcript(&envelope_id, &pk_a, &ct_a, &pk_b, &ct_b);
+    const ss_a = [_]u8{0x11} ** 32;
+    const ss_b = [_]u8{0x22} ** 32;
+    const first = SpookyCombiner.combine(&ss_a, &ss_b, &transcript);
+    const swapped = SpookyCombiner.combine(&ss_b, &ss_a, &transcript);
+    try std.testing.expect(!ctEqual(&first.wrap, &swapped.wrap));
+    try std.testing.expect(!ctEqual(&first.confirm, &swapped.confirm));
+
+    var changed_id = envelope_id;
+    changed_id[0] ^= 1;
+    const changed_transcript = SpookyCombiner.transcript(&changed_id, &pk_a, &ct_a, &pk_b, &ct_b);
+    const changed = SpookyCombiner.combine(&ss_a, &ss_b, &changed_transcript);
+    try std.testing.expect(!ctEqual(&first.wrap, &changed.wrap));
+    try std.testing.expect(!ctEqual(&first.confirm, &changed.confirm));
+}
 
 // ----------------------------------------------------------------------------
 // Fail-closed model manifest and tensor-name expectations for Llama-family GGUF.
@@ -2833,6 +2857,10 @@ test "AES-256-GCM rejects modified ciphertext and AAD" {
     var recovered: [plain.len]u8 = undefined;
     try AeadBox.open(&recovered, &cipher, &tag, "naza/aad/v1", &nonce, &key);
     try std.testing.expectEqualSlices(u8, plain, &recovered);
+    try std.testing.expectError(error.AuthenticationFailed, AeadBox.open(&recovered, &cipher, &tag, "naza/wrong-aad", &nonce, &key));
+    var wrong_key = key;
+    wrong_key[0] ^= 1;
+    try std.testing.expectError(error.AuthenticationFailed, AeadBox.open(&recovered, &cipher, &tag, "naza/aad/v1", &nonce, &wrong_key));
     cipher[0] ^= 1;
     try std.testing.expectError(error.AuthenticationFailed, AeadBox.open(&recovered, &cipher, &tag, "naza/aad/v1", &nonce, &key));
 }
@@ -2842,6 +2870,23 @@ test "file mac changes with payload" {
     const a = FileMac.computeBytes(&key, "a");
     const b = FileMac.computeBytes(&key, "b");
     try std.testing.expect(!ctEqual(&a, &b));
+}
+
+test "NKEY4 envelope is bound to its key and framing" {
+    const allocator = std.testing.allocator;
+    const kek = [_]u8{0x31} ** 32;
+    const data_key = [_]u8{0x72} ** 32;
+    var blob = try KeyEnvelope.wrapAlloc(allocator, &kek, &data_key);
+    defer allocator.free(blob);
+    const opened = try KeyEnvelope.unwrap(allocator, &kek, blob);
+    try std.testing.expectEqualSlices(u8, &data_key, &opened);
+
+    var wrong_kek = kek;
+    wrong_kek[7] ^= 0x40;
+    try std.testing.expectError(error.AuthenticationFailed, KeyEnvelope.unwrap(allocator, &wrong_kek, blob));
+
+    blob[0] ^= 1;
+    try std.testing.expectError(error.InvalidKeyEnvelope, KeyEnvelope.unwrap(allocator, &kek, blob));
 }
 
 test "utf8 streaming validator" {
@@ -6357,8 +6402,6 @@ fn usage() void {
     std.debug.print("  verify <path.gguf>          SHA-256 verify pinned GGUF\n", .{});
     std.debug.print("  gguf <path.gguf>            parse GGUF metadata/tensor table\n", .{});
     std.debug.print("  pqc                         list PQ algorithms + implementation state\n", .{});
-    std.debug.print("  sha3 <text>                 SHA3-256 text\n", .{});
-    std.debug.print("  shake <text> <bytes>        SHAKE256 XOF\n", .{});
     std.debug.print("  selftest                    run built-in crypto checks\n", .{});
 }
 
@@ -6398,14 +6441,14 @@ fn selfTestRuntime() !void {
     var kem_coins: [32]u8 = undefined;
     for (&kem_seed, 0..) |*v, i| v.* = @truncate(i *% 37 +% 11);
     for (&kem_coins, 0..) |*v, i| v.* = @truncate(i *% 19 +% 7);
-    var kem_pk: [800]u8 = undefined;
-    var kem_sk: [1632]u8 = undefined;
-    var kem_ct: [768]u8 = undefined;
+    var kem_pk: [1568]u8 = undefined;
+    var kem_sk: [3168]u8 = undefined;
+    var kem_ct: [1568]u8 = undefined;
     var kem_enc: [32]u8 = undefined;
     var kem_dec: [32]u8 = undefined;
-    Kem.keypair("ML-KEM-512", &kem_seed, &kem_pk, &kem_sk) catch return error.MlKemSelfTestFailed;
-    Kem.encapsulate("ML-KEM-512", &kem_coins, &kem_pk, &kem_ct, &kem_enc) catch return error.MlKemSelfTestFailed;
-    Kem.decapsulate("ML-KEM-512", &kem_sk, &kem_ct, &kem_dec) catch return error.MlKemSelfTestFailed;
+    Kem.keypair("ML-KEM-1024", &kem_seed, &kem_pk, &kem_sk) catch return error.MlKemSelfTestFailed;
+    Kem.encapsulate("ML-KEM-1024", &kem_coins, &kem_pk, &kem_ct, &kem_enc) catch return error.MlKemSelfTestFailed;
+    Kem.decapsulate("ML-KEM-1024", &kem_sk, &kem_ct, &kem_dec) catch return error.MlKemSelfTestFailed;
     if (!ctEqual(&kem_enc, &kem_dec)) return error.MlKemSelfTestFailed;
 }
 
@@ -6767,20 +6810,18 @@ fn runTui(allocator: std.mem.Allocator) !void {
         std.debug.print("  4) Food/Water Scanner\n", .{});
         std.debug.print("  5) GGUF Inspector\n", .{});
         std.debug.print("  6) PQC Catalog\n", .{});
-        std.debug.print("  7) Crypto Lab\n", .{});
-        std.debug.print("  8) Self-test\n", .{});
-        std.debug.print("  9) Exit\n\n", .{});
+        std.debug.print("  7) Self-test\n", .{});
+        std.debug.print("  8) Exit\n\n", .{});
 
-        switch (try tuiChoice(&input, "Choose (1-9)> ", 9)) {
+        switch (try tuiChoice(&input, "Choose (1-8)> ", 8)) {
             1 => try tuiModelManager(&input),
             2 => try tuiChatPreview(allocator, &input),
             3 => try tuiScanner(allocator, &input, false),
             4 => try tuiScanner(allocator, &input, true),
             5 => try tuiGguf(&input),
             6 => tuiPqc(&input),
-            7 => try tuiCryptoLab(allocator, &input),
-            8 => tuiSelfTest(&input),
-            9 => {
+            7 => tuiSelfTest(&input),
+            8 => {
                 tuiClear();
                 std.debug.print("Goodbye.\n", .{});
                 return;
@@ -6828,22 +6869,6 @@ pub fn main() !void {
     }
     if (std.mem.eql(u8, args[1], "pqc")) {
         for (pqc_algorithms) |a| std.debug.print("{s}\t{s}\t{s}\t{s}\n", .{ a.id, @tagName(a.kind), @tagName(a.status), @tagName(a.implementation) });
-        return;
-    }
-    if (std.mem.eql(u8, args[1], "sha3")) {
-        if (args.len != 3) return error.InvalidArguments;
-        const out = sha3_256(args[2]);
-        printHex(&out);
-        return;
-    }
-    if (std.mem.eql(u8, args[1], "shake")) {
-        if (args.len != 4) return error.InvalidArguments;
-        const n = try std.fmt.parseInt(usize, args[3], 10);
-        if (n > 1024 * 1024) return error.OutputTooLong;
-        const out = try allocator.alloc(u8, n);
-        defer allocator.free(out);
-        shake256(args[2], out);
-        printHex(out);
         return;
     }
     if (std.mem.eql(u8, args[1], "gguf")) {
@@ -6943,6 +6968,7 @@ pub const MlKemBitCodec = struct {
         var pos: usize = 0;
         const mask: u16 = @truncate((@as(u32, 1) << bits) - 1);
         for (values) |v| {
+            if (v > mask) return error.NonCanonicalEncoding;
             acc |= @as(u64, v & mask) << acc_bits;
             acc_bits += bits;
             while (acc_bits >= 8) {
@@ -6978,6 +7004,16 @@ pub const MlKemBitCodec = struct {
         }
     }
 };
+
+test "ML-KEM bit codec rejects non-canonical values" {
+    var out: [1]u8 = undefined;
+    try std.testing.expectError(error.NonCanonicalEncoding, MlKemBitCodec.pack(&out, &[_]u16{16}, 4));
+    try MlKemBitCodec.pack(&out, &[_]u16{15, 0}, 4);
+    var values: [2]u16 = undefined;
+    try MlKemBitCodec.unpack(&values, &out, 4);
+    try std.testing.expectEqual(@as(u16, 15), values[0]);
+    try std.testing.expectEqual(@as(u16, 0), values[1]);
+}
 
 pub const MlKemSerialization = struct {
     pub fn packPolyVec(out: []u8, v: *const MlKemVec.PolyVec, k: usize) !void {
@@ -62885,6 +62921,32 @@ test "realized ML-KEM-512 deterministic encapsulation round trip" {
     var rejected: [32]u8 = undefined;
     try Kem.decapsulate("ML-KEM-512", &sk, &ct, &rejected);
     try std.testing.expect(!ctEqual(&ss_enc, &rejected));
+}
+
+test "original Naza ML-KEM-1024 path is deterministic and rejects tampering" {
+    var seed: [64]u8 = undefined;
+    var coins: [32]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @truncate(i *% 29 +% 3);
+    for (&coins, 0..) |*b, i| b.* = @truncate(i *% 41 +% 9);
+
+    var pk_a: [1568]u8 = undefined;
+    var sk_a: [3168]u8 = undefined;
+    var pk_b: [1568]u8 = undefined;
+    var sk_b: [3168]u8 = undefined;
+    try Kem.keypair("ML-KEM-1024", &seed, &pk_a, &sk_a);
+    try Kem.keypair("ML-KEM-1024", &seed, &pk_b, &sk_b);
+    try std.testing.expectEqualSlices(u8, &pk_a, &pk_b);
+    try std.testing.expectEqualSlices(u8, &sk_a, &sk_b);
+
+    var ct: [1568]u8 = undefined;
+    var enc: [32]u8 = undefined;
+    var dec: [32]u8 = undefined;
+    try Kem.encapsulate("ML-KEM-1024", &coins, &pk_a, &ct, &enc);
+    try Kem.decapsulate("ML-KEM-1024", &sk_a, &ct, &dec);
+    try std.testing.expectEqualSlices(u8, &enc, &dec);
+    ct[ct.len - 1] ^= 0x80;
+    try Kem.decapsulate("ML-KEM-1024", &sk_a, &ct, &dec);
+    try std.testing.expect(!ctEqual(&enc, &dec));
 }
 
 test "ML-DSA facade fails closed pending interoperability" {
