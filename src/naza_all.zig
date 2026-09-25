@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const AndroidKeystoreOptions = @import("android_keystore_options");
 
 // ============================================================================
 // NAZA ALL-ZIG MONOLITH
@@ -2478,10 +2480,128 @@ pub const KeyEnvelope = struct {
     }
 };
 
-pub const PassphraseKdf = struct {
-    pub const rounds_default: u32 = 600_000;
+/// Password-wrapped data-key envelope for new records. NKEY4 remains
+/// readable through KeyEnvelope.unwrap; new password-protected keys use this
+/// bounded, parameter-carrying Argon2id format.
+pub const PasswordKeyEnvelope = struct {
+    pub const magic = "NKEY5";
+    pub const version: u8 = 1;
+    pub const salt_length = 16;
+    pub const header_length = magic.len + 1 + 4 + 4 + 4 + salt_length;
+    pub const aad_label = "naza/password-key-envelope/v5";
 
-    pub fn derive(passphrase: []const u8, salt: []const u8, rounds: u32) ![32]u8 {
+    pub fn wrapAlloc(allocator: std.mem.Allocator, passphrase: []const u8, data_key: *const [32]u8) ![]u8 {
+        return wrapWithParams(allocator, passphrase, data_key, PassphraseKdf.default_params);
+    }
+
+    pub fn wrapWithParams(allocator: std.mem.Allocator, passphrase: []const u8, data_key: *const [32]u8, params: PassphraseKdf.Params) ![]u8 {
+        var salt: [salt_length]u8 = undefined;
+        std.crypto.random.bytes(&salt);
+        defer secureZero(&salt);
+
+        var header: [header_length]u8 = undefined;
+        @memcpy(header[0..magic.len], magic);
+        header[5] = version;
+        try writeU32Le(header[6..10], params.memory_kib);
+        try writeU32Le(header[10..14], params.time_cost);
+        try writeU32Le(header[14..18], params.lanes);
+        @memcpy(header[18..], &salt);
+
+        var aad: [header_length + aad_label.len]u8 = undefined;
+        @memcpy(aad[0..header_length], &header);
+        @memcpy(aad[header_length..], aad_label);
+
+        var kek = try PassphraseKdf.derive(allocator, passphrase, &salt, params);
+        defer secureZero(&kek);
+
+        const sealed = try SealedRecord.sealAlloc(allocator, &kek, &aad, data_key);
+        defer allocator.free(sealed);
+        const out = try allocator.alloc(u8, header_length + sealed.len);
+        errdefer allocator.free(out);
+        @memcpy(out[0..header_length], &header);
+        @memcpy(out[header_length..], sealed);
+        return out;
+    }
+
+    pub fn unwrap(allocator: std.mem.Allocator, passphrase: []const u8, blob: []const u8) ![32]u8 {
+        if (blob.len < header_length + SealedRecord.header_len + AeadBox.tag_length) return error.InvalidKeyEnvelope;
+        if (!std.mem.eql(u8, blob[0..magic.len], magic) or blob[5] != version) return error.InvalidKeyEnvelope;
+
+        const lanes = try readU32Le(blob[14..18]);
+        if (lanes > std.math.maxInt(u24)) return error.InvalidKeyEnvelope;
+        const params = PassphraseKdf.Params{
+            .memory_kib = try readU32Le(blob[6..10]),
+            .time_cost = try readU32Le(blob[10..14]),
+            .lanes = @intCast(lanes),
+        };
+        var kek = try PassphraseKdf.derive(allocator, passphrase, blob[18..header_length], params);
+        defer secureZero(&kek);
+        var aad: [header_length + aad_label.len]u8 = undefined;
+        @memcpy(aad[0..header_length], blob[0..header_length]);
+        @memcpy(aad[header_length..], aad_label);
+        const raw = try SealedRecord.openAlloc(allocator, &kek, &aad, blob[header_length..]);
+        defer {
+            secureZero(raw);
+            allocator.free(raw);
+        }
+        if (raw.len != 32) return error.InvalidKeyEnvelope;
+        var out: [32]u8 = undefined;
+        @memcpy(&out, raw);
+        return out;
+    }
+
+    /// Rewrap one authenticated NKEY4 data key. The caller owns replacement
+    /// and backup policy for its containing encrypted-data store.
+    pub fn migrateNkey4Alloc(allocator: std.mem.Allocator, old_kek: *const [32]u8, old_blob: []const u8, new_passphrase: []const u8) ![]u8 {
+        var data_key = try KeyEnvelope.unwrap(allocator, old_kek, old_blob);
+        defer secureZero(&data_key);
+        return wrapAlloc(allocator, new_passphrase, &data_key);
+    }
+
+    /// Convenience migration for legacy passphrase-derived NKEY4 keys.
+    pub fn migrateNkey4PassphraseAlloc(allocator: std.mem.Allocator, old_passphrase: []const u8, old_salt: []const u8, old_rounds: u32, old_blob: []const u8, new_passphrase: []const u8) ![]u8 {
+        var old_kek = try PassphraseKdf.derivePbkdf2Legacy(old_passphrase, old_salt, old_rounds);
+        defer secureZero(&old_kek);
+        return migrateNkey4Alloc(allocator, &old_kek, old_blob, new_passphrase);
+    }
+};
+
+pub const PassphraseKdf = struct {
+    pub const Params = struct {
+        time_cost: u32 = 3,
+        memory_kib: u32 = 64 * 1024,
+        lanes: u24 = 1,
+    };
+
+    pub const default_params = Params{};
+    pub const min_memory_kib: u32 = 19 * 1024;
+    pub const max_memory_kib: u32 = 256 * 1024;
+    pub const max_time_cost: u32 = 10;
+    pub const max_lanes: u24 = 4;
+
+    /// Argon2id v1.3 key derivation. Parameter bounds are checked before the
+    /// allocator is asked for memory so a corrupt envelope cannot request an
+    /// unbounded allocation or computation.
+    pub fn derive(allocator: std.mem.Allocator, passphrase: []const u8, salt: []const u8, params: Params) ![32]u8 {
+        if (passphrase.len < 8) return error.WeakPassphrase;
+        if (salt.len < 16) return error.WeakSalt;
+        if (params.time_cost < 2 or params.time_cost > max_time_cost) return error.WeakParameters;
+        if (params.memory_kib < min_memory_kib or params.memory_kib > max_memory_kib) return error.WeakParameters;
+        if (params.lanes < 1 or params.lanes > max_lanes) return error.WeakParameters;
+        if (params.memory_kib < 8 * params.lanes) return error.WeakParameters;
+        var out: [32]u8 = undefined;
+        errdefer secureZero(&out);
+        try std.crypto.pwhash.argon2.kdf(allocator, &out, passphrase, salt, .{
+            .t = params.time_cost,
+            .m = params.memory_kib,
+            .p = params.lanes,
+        }, .argon2id);
+        return out;
+    }
+
+    /// Legacy NKEY4-compatible PBKDF2 derivation. New records must use
+    /// derive()/Argon2id; retain this only to open and migrate older records.
+    pub fn derivePbkdf2Legacy(passphrase: []const u8, salt: []const u8, rounds: u32) ![32]u8 {
         if (passphrase.len < 8) return error.WeakPassphrase;
         if (salt.len < 16) return error.WeakSalt;
         if (rounds < 100_000) return error.WeakParameters;
@@ -2887,6 +3007,58 @@ test "NKEY4 envelope is bound to its key and framing" {
 
     blob[0] ^= 1;
     try std.testing.expectError(error.InvalidKeyEnvelope, KeyEnvelope.unwrap(allocator, &kek, blob));
+}
+
+test "Argon2id matches RFC 9106 section 5.3 vector" {
+    const password = [_]u8{0x01} ** 32;
+    const salt = [_]u8{0x02} ** 16;
+    const secret = [_]u8{0x03} ** 8;
+    const associated_data = [_]u8{0x04} ** 12;
+    var got: [32]u8 = undefined;
+    try std.crypto.pwhash.argon2.kdf(std.testing.allocator, &got, &password, &salt, .{
+        .t = 3,
+        .m = 32,
+        .p = 4,
+        .secret = &secret,
+        .ad = &associated_data,
+    }, .argon2id);
+    var expected: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected, "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659");
+    try std.testing.expectEqualSlices(u8, &expected, &got);
+}
+
+test "Keystore RSA verifier accepts OpenSSL signature and rejects tampering" {
+    var modulus: [256]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&modulus, "DB7008C9864E03F0E3EEFFF3856371BF13C6F3351EC1CFC39603AAF1C4C7C4A8FDCB6FAAB4CCEB953A96EB8B0D4ED6ABADB10F8AE00F54F3150B56845C6697324A42519BDE4EAD10131D286498DA17A027496E626B9667C818E77F5FFB802E3910822CB6D6B725FE902C26F3A3C4A3654B64FAC9E450F698C388CEA884F3655E0759002513446FFA07DD7F81BD5F9CA3841E6D289D47748F7C192441C18CC95434DBEA7F733302A147DCBAB43A21342D2339719AA8611F827B6F13FBA43FBFB57C5202AEECA78D8A1899E431CACC329E32C46DBB03D03B17A7197BAFBB0114F3ED446FE53AA8B4D98BD010E6478B9448C10C3E445A8F36B859796231F0B0BD87");
+    var signature: [256]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&signature, "69f7ce80cf7417f646d1a45f082318daf4e31a2b91916161340a602da56f3976f4a6683b0169b8db8504cfb0f3d9c04d2a7b6d770f293aa35ea6f1531ac60bd5e96b37243466c6f9fec6bb66a2b8868bd1b1d3574c96b6a2bb3deb31a8f00b9776b8f40b6a66b1909066eb3e51a7e220cd0f3b4ae12cece9febf89e0332963e2d3025e2260014cd5a9ca51f915395dcfbc3f0ec9551061109ffc52d768e8b3a8e0227ac534770f8297c5511553dc237b0dbeefdaabe92c4364a66884931a3f1b72db89198f14a504c2cd97b3c4a90b81a86ac42072ffc90d9f5b376a6fc5a5aaf6836da67d0eb81bfca85ee567ad34bb08a443697bcb40bb95916ba3981f17fa");
+    try AndroidKeystoreGate.verifySignature("DB7008C9864E03F0E3EEFFF3856371BF13C6F3351EC1CFC39603AAF1C4C7C4A8FDCB6FAAB4CCEB953A96EB8B0D4ED6ABADB10F8AE00F54F3150B56845C6697324A42519BDE4EAD10131D286498DA17A027496E626B9667C818E77F5FFB802E3910822CB6D6B725FE902C26F3A3C4A3654B64FAC9E450F698C388CEA884F3655E0759002513446FFA07DD7F81BD5F9CA3841E6D289D47748F7C192441C18CC95434DBEA7F733302A147DCBAB43A21342D2339719AA8611F827B6F13FBA43FBFB57C5202AEECA78D8A1899E431CACC329E32C46DBB03D03B17A7197BAFBB0114F3ED446FE53AA8B4D98BD010E6478B9448C10C3E445A8F36B859796231F0B0BD87", "10001", "NAZA-GATE-TEST-VECTOR", &signature);
+    signature[0] ^= 1;
+    try std.testing.expectError(error.KeystoreProofInvalid, AndroidKeystoreGate.verifySignature("DB7008C9864E03F0E3EEFFF3856371BF13C6F3351EC1CFC39603AAF1C4C7C4A8FDCB6FAAB4CCEB953A96EB8B0D4ED6ABADB10F8AE00F54F3150B56845C6697324A42519BDE4EAD10131D286498DA17A027496E626B9667C818E77F5FFB802E3910822CB6D6B725FE902C26F3A3C4A3654B64FAC9E450F698C388CEA884F3655E0759002513446FFA07DD7F81BD5F9CA3841E6D289D47748F7C192441C18CC95434DBEA7F733302A147DCBAB43A21342D2339719AA8611F827B6F13FBA43FBFB57C5202AEECA78D8A1899E431CACC329E32C46DBB03D03B17A7197BAFBB0114F3ED446FE53AA8B4D98BD010E6478B9448C10C3E445A8F36B859796231F0B0BD87", "10001", "NAZA-GATE-TEST-VECTOR", &signature));
+}
+
+test "NKEY4 passphrase key migrates into authenticated NKEY5 Argon2id envelope" {
+    const allocator = std.testing.allocator;
+    const old_passphrase = "old NKEY4 passphrase";
+    const old_salt = "nkey4-test-salt!";
+    const new_passphrase = "new NKEY5 passphrase";
+    const data_key = [_]u8{0xa7} ** 32;
+
+    var old_kek = try PassphraseKdf.derivePbkdf2Legacy(old_passphrase, old_salt, 100_000);
+    defer secureZero(&old_kek);
+    const old_blob = try KeyEnvelope.wrapAlloc(allocator, &old_kek, &data_key);
+    defer allocator.free(old_blob);
+
+    const upgraded = try PasswordKeyEnvelope.migrateNkey4PassphraseAlloc(allocator, old_passphrase, old_salt, 100_000, old_blob, new_passphrase);
+    defer allocator.free(upgraded);
+    const opened = try PasswordKeyEnvelope.unwrap(allocator, new_passphrase, upgraded);
+    try std.testing.expectEqualSlices(u8, &data_key, &opened);
+    try std.testing.expectError(error.AuthenticationFailed, PasswordKeyEnvelope.unwrap(allocator, "wrong passphrase", upgraded));
+
+    var oversized = try allocator.dupe(u8, upgraded);
+    defer allocator.free(oversized);
+    try writeU32Le(oversized[6..10], PassphraseKdf.max_memory_kib + 1);
+    try std.testing.expectError(error.WeakParameters, PasswordKeyEnvelope.unwrap(allocator, new_passphrase, oversized));
 }
 
 test "utf8 streaming validator" {
@@ -6257,6 +6429,8 @@ pub const PqcAlgorithm = struct {
 };
 
 pub const pqc_algorithms = [_]PqcAlgorithm{
+    .{ .id = "ML-KEM-512", .kind = .kem, .basis = .lattice, .status = .nist_standard, .implementation = .implemented_unverified },
+    .{ .id = "ML-KEM-768", .kind = .kem, .basis = .lattice, .status = .nist_standard, .implementation = .implemented_unverified },
     .{ .id = "ML-KEM-1024", .kind = .kem, .basis = .lattice, .status = .nist_standard, .implementation = .implemented_unverified },
     .{ .id = "HQC-256", .kind = .kem, .basis = .code, .status = .nist_selected, .implementation = .partial },
     .{ .id = "ML-KEM-1024+HQC-256", .kind = .hybrid, .basis = .mixed, .status = .research, .implementation = .catalog_only },
@@ -6275,7 +6449,10 @@ pub fn pqcUsable(id: []const u8) bool {
 
 pub fn pqcCallable(id: []const u8) bool {
     const a = findPqc(id) orelse return false;
-    return a.implementation == .implemented_unverified or a.implementation == .implemented or a.implementation == .verified_vectors;
+    // Experimental code remains directly testable through its implementation
+    // APIs, but the public dispatch facade is production-gated until vectors
+    // and independent interoperability checks have passed.
+    return a.implementation == .implemented or a.implementation == .verified_vectors;
 }
 
 pub const Kem = struct {
@@ -6300,6 +6477,7 @@ pub const Kem = struct {
 
     pub fn keypair(id: []const u8, seed: []const u8, pk: []u8, sk: []u8) !void {
         const params = mlKemParams(id) orelse return error.UnsupportedAlgorithm;
+        if (!pqcCallable(id)) return error.AlgorithmNotCallable;
         if (seed.len < 64) return error.SeedTooShort;
         var d: [32]u8 = undefined;
         var z: [32]u8 = undefined;
@@ -6312,6 +6490,7 @@ pub const Kem = struct {
 
     pub fn encapsulate(id: []const u8, randomness: []const u8, pk: []const u8, ct: []u8, ss: []u8) !void {
         const params = mlKemParams(id) orelse return error.UnsupportedAlgorithm;
+        if (!pqcCallable(id)) return error.AlgorithmNotCallable;
         if (randomness.len < 32) return error.SeedTooShort;
         if (ss.len != 32) return error.LengthMismatch;
         var m: [32]u8 = undefined;
@@ -6325,6 +6504,7 @@ pub const Kem = struct {
 
     pub fn decapsulate(id: []const u8, sk: []const u8, ct: []const u8, ss: []u8) !void {
         const params = mlKemParams(id) orelse return error.UnsupportedAlgorithm;
+        if (!pqcCallable(id)) return error.AlgorithmNotCallable;
         if (ss.len != 32) return error.LengthMismatch;
         var shared: [32]u8 = undefined;
         defer secureZero(&shared);
@@ -6435,9 +6615,19 @@ fn selfTestRuntime() !void {
     const c = MlKem.mulNegacyclic(a, b);
     if (c[0] != 0 or c[1] != 1 or c[255] != 1) return error.MlKemNegacyclicFailed;
 
-    // Exercise the public ML-KEM dispatch path with deterministic inputs. This
-    // keeps the CLI self-test aligned with the implementation claims exposed
-    // by `pqc` and the public API.
+    // Do not run unverified ML-KEM through the CLI self-test. The primitive is
+    // exercised in development-only tests below; production dispatch remains
+    // disabled until official vectors and independent differential checks pass.
+    if (!pqcCallable("ML-KEM-1024")) {
+        var no_bytes: [0]u8 = .{};
+        Kem.keypair("ML-KEM-1024", "", &no_bytes, &no_bytes) catch |err| {
+            if (err == error.AlgorithmNotCallable) return;
+            return error.MlKemSelfTestFailed;
+        };
+        return error.MlKemSelfTestFailed;
+    }
+
+    // Exercise a vector-verified algorithm here after it becomes callable.
     var kem_seed: [64]u8 = undefined;
     var kem_coins: [32]u8 = undefined;
     for (&kem_seed, 0..) |*v, i| v.* = @truncate(i *% 37 +% 11);
@@ -6832,12 +7022,157 @@ fn runTui(allocator: std.mem.Allocator) !void {
     }
 }
 
+pub const AndroidKeystoreGate = struct {
+    const modulus_length = 256;
+    const challenge_domain = "NAZA-ANDROID-UNLOCK-V1\x00";
+
+    fn jsonField(value: std.json.Value, name: []const u8) ?std.json.Value {
+        return switch (value) {
+            .object => |object| object.get(name),
+            else => null,
+        };
+    }
+
+    fn jsonString(value: ?std.json.Value) ?[]const u8 {
+        const v = value orelse return null;
+        return switch (v) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
+    fn jsonBool(value: ?std.json.Value) ?bool {
+        const v = value orelse return null;
+        return switch (v) {
+            .bool => |b| b,
+            else => null,
+        };
+    }
+
+    fn jsonInt(value: ?std.json.Value) ?i64 {
+        const v = value orelse return null;
+        return switch (v) {
+            .integer => |n| n,
+            else => null,
+        };
+    }
+
+    fn captureBridge(allocator: std.mem.Allocator, argv: []const []const u8, stdin_data: ?[]const u8, max_output: usize) ![]u8 {
+        var child = std.process.Child.init(argv, allocator);
+        child.stdin_behavior = if (stdin_data != null) .Pipe else .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Inherit;
+        try child.spawn();
+        errdefer {
+            _ = child.kill() catch {};
+        }
+
+        if (stdin_data) |data| {
+            try child.stdin.?.writeAll(data);
+            child.stdin.?.close();
+            child.stdin = null;
+        }
+
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(allocator);
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = try child.stdout.?.read(&buf);
+            if (n == 0) break;
+            if (n > max_output or output.items.len > max_output - n) return error.KeystoreOutputTooLong;
+            try output.appendSlice(allocator, buf[0..n]);
+        }
+        child.stdout.?.close();
+        child.stdout = null;
+        switch (try child.wait()) {
+            .Exited => |code| if (code != 0) return error.KeystoreCommandFailed,
+            else => return error.KeystoreCommandFailed,
+        }
+        return output.toOwnedSlice(allocator);
+    }
+
+    fn verifyKeyEnrollment(allocator: std.mem.Allocator, details: []const u8) !void {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, details, .{});
+        defer parsed.deinit();
+        const entries = switch (parsed.value) {
+            .array => |array| array.items,
+            else => return error.KeystoreMetadataInvalid,
+        };
+
+        var matching: ?std.json.Value = null;
+        for (entries) |entry| {
+            const alias = jsonString(jsonField(entry, "alias")) orelse continue;
+            if (!std.mem.eql(u8, alias, AndroidKeystoreOptions.key_alias)) continue;
+            if (matching != null) return error.KeystoreMetadataInvalid;
+            matching = entry;
+        }
+        const entry = matching orelse return error.KeystoreKeyMissing;
+        if (!std.mem.eql(u8, jsonString(jsonField(entry, "algorithm")) orelse return error.KeystoreMetadataInvalid, "RSA")) return error.KeystoreMetadataInvalid;
+        if (jsonInt(jsonField(entry, "size")) != 2048) return error.KeystoreMetadataInvalid;
+        if (jsonBool(jsonField(entry, "inside_secure_hardware")) != true) return error.KeystoreNotHardwareBacked;
+        if (!std.ascii.eqlIgnoreCase(jsonString(jsonField(entry, "modulus")) orelse return error.KeystoreMetadataInvalid, AndroidKeystoreOptions.rsa_modulus_hex)) return error.KeystoreKeyChanged;
+        if (!std.ascii.eqlIgnoreCase(jsonString(jsonField(entry, "exponent")) orelse return error.KeystoreMetadataInvalid, AndroidKeystoreOptions.rsa_exponent_hex)) return error.KeystoreKeyChanged;
+
+        const auth = jsonField(entry, "user_authentication") orelse return error.KeystoreMetadataInvalid;
+        if (jsonBool(jsonField(auth, "required")) != true or jsonBool(jsonField(auth, "enforced_by_secure_hardware")) != true) return error.KeystoreAuthenticationNotHardwareEnforced;
+    }
+
+    fn verifySignature(modulus_hex: []const u8, exponent_hex: []const u8, challenge: []const u8, signature: []const u8) !void {
+        if (modulus_hex.len != modulus_length * 2 or exponent_hex.len == 0 or exponent_hex.len > 8 or signature.len != modulus_length) return error.KeystoreProofInvalid;
+        var modulus: [modulus_length]u8 = undefined;
+        const modulus_bytes = std.fmt.hexToBytes(&modulus, modulus_hex) catch return error.KeystoreProofInvalid;
+        var exponent: [4]u8 = undefined;
+        var normalized_exponent: [8]u8 = undefined;
+        const normalized_hex = if (exponent_hex.len % 2 == 0) exponent_hex else blk: {
+            normalized_exponent[0] = '0';
+            @memcpy(normalized_exponent[1 .. exponent_hex.len + 1], exponent_hex);
+            break :blk normalized_exponent[0 .. exponent_hex.len + 1];
+        };
+        const exponent_bytes = std.fmt.hexToBytes(&exponent, normalized_hex) catch return error.KeystoreProofInvalid;
+        const public_key = std.crypto.Certificate.rsa.PublicKey.fromBytes(exponent_bytes, modulus_bytes) catch return error.KeystoreProofInvalid;
+        const sig: [modulus_length]u8 = signature[0..modulus_length].*;
+        std.crypto.Certificate.rsa.PKCS1v1_5Signature.verify(modulus_length, sig, challenge, public_key, std.crypto.hash.sha2.Sha256) catch return error.KeystoreProofInvalid;
+    }
+
+    pub fn authenticate(allocator: std.mem.Allocator) !void {
+        if (AndroidKeystoreOptions.rsa_modulus_hex.len != modulus_length * 2 or AndroidKeystoreOptions.termux_keystore_path.len == 0) return error.KeystoreGateNotConfigured;
+
+        const list_argv = [_][]const u8{ AndroidKeystoreOptions.termux_keystore_path, "list", "-d" };
+        const details = try captureBridge(allocator, &list_argv, null, 1024 * 1024);
+        defer allocator.free(details);
+        try verifyKeyEnrollment(allocator, details);
+
+        var nonce: [32]u8 = undefined;
+        std.crypto.random.bytes(&nonce);
+        defer secureZero(&nonce);
+        var challenge: [challenge_domain.len + nonce.len]u8 = undefined;
+        @memcpy(challenge[0..challenge_domain.len], challenge_domain);
+        @memcpy(challenge[challenge_domain.len..], &nonce);
+        defer secureZero(&challenge);
+
+        const sign_argv = [_][]const u8{ AndroidKeystoreOptions.termux_keystore_path, "sign", AndroidKeystoreOptions.key_alias, "SHA256withRSA" };
+        const signature = try captureBridge(allocator, &sign_argv, &challenge, modulus_length + 1);
+        defer secureZero(signature);
+        defer allocator.free(signature);
+        try verifySignature(AndroidKeystoreOptions.rsa_modulus_hex, AndroidKeystoreOptions.rsa_exponent_hex, &challenge, signature);
+    }
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
+
+    if (builtin.abi == .android) try AndroidKeystoreGate.authenticate(allocator);
+
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "install")) {
+        var input = TuiInput{ .file = std.fs.File.stdin() };
+        try runAndroidInstallCheckpoint(&input);
+        return;
+    }
+
     if (args.len < 2) {
         if (std.fs.File.stdin().isTty()) {
             try runTui(allocator);
@@ -6851,12 +7186,6 @@ pub fn main() !void {
         try runTui(allocator);
         return;
     }
-    if (std.mem.eql(u8, args[1], "install")) {
-        var input = TuiInput{ .file = std.fs.File.stdin() };
-        try runAndroidInstallCheckpoint(&input);
-        return;
-    }
-
     if (std.mem.eql(u8, args[1], "model")) {
         std.debug.print("file: {s}\nsha256: {s}\nrepo: {s}\n", .{ PinnedModel.file, PinnedModel.sha256_hex, PinnedModel.repo });
         return;
@@ -7227,7 +7556,7 @@ pub const MlKemKdf = struct {
     }
 };
 
-pub const MlKemKem = struct {
+const MlKemKem = struct {
     pub fn keypair(pk: []u8, sk: []u8, d: *const [32]u8, z: *const [32]u8, params: MlKem.Params) !void {
         const ind_sk_n = MlKemSizes.indCpaSecretKeyBytes(params);
         const pk_n = MlKemSizes.indCpaPublicKeyBytes(params);
@@ -10117,9 +10446,9 @@ pub const RuntimeHealth = struct {
 pub const CryptoCapabilityMatrix = struct {
     pub const Capability = struct { name: []const u8, keygen: bool, encaps: bool, decaps: bool, sign: bool, verify: bool, kat_verified: bool };
     pub const rows = [_]Capability{
-        .{ .name = "ML-KEM-512", .keygen = true, .encaps = true, .decaps = true, .sign = false, .verify = false, .kat_verified = false },
-        .{ .name = "ML-KEM-768", .keygen = true, .encaps = true, .decaps = true, .sign = false, .verify = false, .kat_verified = false },
-        .{ .name = "ML-KEM-1024", .keygen = true, .encaps = true, .decaps = true, .sign = false, .verify = false, .kat_verified = false },
+        .{ .name = "ML-KEM-512", .keygen = false, .encaps = false, .decaps = false, .sign = false, .verify = false, .kat_verified = false },
+        .{ .name = "ML-KEM-768", .keygen = false, .encaps = false, .decaps = false, .sign = false, .verify = false, .kat_verified = false },
+        .{ .name = "ML-KEM-1024", .keygen = false, .encaps = false, .decaps = false, .sign = false, .verify = false, .kat_verified = false },
         .{ .name = "ML-DSA-44", .keygen = true, .encaps = false, .decaps = false, .sign = true, .verify = true, .kat_verified = false },
         .{ .name = "ML-DSA-65", .keygen = true, .encaps = false, .decaps = false, .sign = true, .verify = true, .kat_verified = false },
         .{ .name = "ML-DSA-87", .keygen = true, .encaps = false, .decaps = false, .sign = true, .verify = true, .kat_verified = false },
@@ -22032,9 +22361,9 @@ pub const Wave20SelfAudit = struct {
     pub const State = enum { unavailable, partial, implemented_unverified, implemented, vector_verified };
     pub const Capability = struct { name: []const u8, state: State, note: []const u8 };
     pub const capabilities = [_]Capability{
-        .{ .name = "ML-KEM-512", .state = .implemented_unverified, .note = "IND-CPA/KEM path present; vectors not executed here" },
-        .{ .name = "ML-KEM-768", .state = .implemented_unverified, .note = "IND-CPA/KEM path present; vectors not executed here" },
-        .{ .name = "ML-KEM-1024", .state = .implemented_unverified, .note = "IND-CPA/KEM path present; vectors not executed here" },
+        .{ .name = "ML-KEM-512", .state = .implemented_unverified, .note = "NIST ACVP keygen/encapsulation/decapsulation vectors pass; differential review pending" },
+        .{ .name = "ML-KEM-768", .state = .implemented_unverified, .note = "NIST ACVP keygen/encapsulation/decapsulation vectors pass; differential review pending" },
+        .{ .name = "ML-KEM-1024", .state = .implemented_unverified, .note = "NIST ACVP keygen/encapsulation/decapsulation vectors pass; differential review pending" },
         .{ .name = "ML-DSA-44", .state = .partial, .note = "sign/verify interoperability fails; public facade is fail-closed" },
         .{ .name = "ML-DSA-65", .state = .partial, .note = "sign/verify interoperability fails; public facade is fail-closed" },
         .{ .name = "ML-DSA-87", .state = .partial, .note = "sign/verify interoperability fails; public facade is fail-closed" },
@@ -62889,6 +63218,152 @@ test "wave50 verifier policy contradiction dominates" {
 // They are deterministic and require no operating-system randomness.
 // ============================================================================
 
+fn testMlKemParams(id: []const u8) ?MlKem.Params {
+    if (std.mem.eql(u8, id, "ML-KEM-512")) return MlKem.p512;
+    if (std.mem.eql(u8, id, "ML-KEM-768")) return MlKem.p768;
+    if (std.mem.eql(u8, id, "ML-KEM-1024")) return MlKem.p1024;
+    return null;
+}
+
+fn testMlKemKeypair(id: []const u8, seed: []const u8, pk: []u8, sk: []u8) !void {
+    const params = testMlKemParams(id) orelse return error.UnsupportedAlgorithm;
+    if (seed.len < 64) return error.SeedTooShort;
+    var d: [32]u8 = undefined;
+    var z: [32]u8 = undefined;
+    @memcpy(&d, seed[0..32]);
+    @memcpy(&z, seed[32..64]);
+    defer secureZero(&d);
+    defer secureZero(&z);
+    try MlKemKem.keypair(pk, sk, &d, &z, params);
+}
+
+fn testMlKemEncapsulate(id: []const u8, randomness: []const u8, pk: []const u8, ct: []u8, ss: []u8) !void {
+    const params = testMlKemParams(id) orelse return error.UnsupportedAlgorithm;
+    if (randomness.len < 32) return error.SeedTooShort;
+    if (ss.len != 32) return error.LengthMismatch;
+    var message: [32]u8 = undefined;
+    var shared: [32]u8 = undefined;
+    @memcpy(&message, randomness[0..32]);
+    defer secureZero(&message);
+    defer secureZero(&shared);
+    try MlKemKem.encapsulate(ct, &shared, pk, &message, params);
+    @memcpy(ss, &shared);
+}
+
+fn testMlKemDecapsulate(id: []const u8, sk: []const u8, ct: []const u8, ss: []u8) !void {
+    const params = testMlKemParams(id) orelse return error.UnsupportedAlgorithm;
+    if (ss.len != 32) return error.LengthMismatch;
+    var shared: [32]u8 = undefined;
+    defer secureZero(&shared);
+    try MlKemKem.decapsulate(&shared, ct, sk, params);
+    @memcpy(ss, &shared);
+}
+
+fn acvpField(value: std.json.Value, name: []const u8) !std.json.Value {
+    return switch (value) {
+        .object => |object| object.get(name) orelse error.AcVpFieldMissing,
+        else => error.AcVpObjectExpected,
+    };
+}
+
+fn acvpArray(value: std.json.Value) ![]std.json.Value {
+    return switch (value) {
+        .array => |array| array.items,
+        else => error.AcVpArrayExpected,
+    };
+}
+
+fn acvpString(value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => |string| string,
+        else => error.AcVpStringExpected,
+    };
+}
+
+fn acvpInteger(value: std.json.Value) !i64 {
+    return switch (value) {
+        .integer => |integer| integer,
+        else => error.AcVpIntegerExpected,
+    };
+}
+
+fn acvpDecodeHex(allocator: std.mem.Allocator, encoded: []const u8, expected_len: usize) ![]u8 {
+    if (encoded.len != expected_len * 2) return error.AcVpVectorLengthMismatch;
+    const decoded = try allocator.alloc(u8, expected_len);
+    errdefer allocator.free(decoded);
+    _ = try std.fmt.hexToBytes(decoded, encoded);
+    return decoded;
+}
+
+fn expectAcvpFixtureDigest(bytes: []const u8, expected_hex: []const u8) !void {
+    var actual: [32]u8 = undefined;
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+    _ = try std.fmt.hexToBytes(&expected, expected_hex);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+fn runAcvpMlKemKeygenVector(allocator: std.mem.Allocator, params: MlKem.Params, prompt: std.json.Value, expected: std.json.Value) !void {
+    var d = try acvpDecodeHex(allocator, try acvpString(try acvpField(prompt, "d")), 32);
+    defer secureZero(d);
+    defer allocator.free(d);
+    var z = try acvpDecodeHex(allocator, try acvpString(try acvpField(prompt, "z")), 32);
+    defer secureZero(z);
+    defer allocator.free(z);
+
+    const pk = try allocator.alloc(u8, MlKemSizes.publicKeyBytes(params));
+    defer allocator.free(pk);
+    const sk = try allocator.alloc(u8, MlKemSizes.secretKeyBytes(params));
+    defer allocator.free(sk);
+    try MlKemKem.keypair(pk, sk, d[0..32], z[0..32], params);
+
+    const expected_pk = try acvpDecodeHex(allocator, try acvpString(try acvpField(expected, "ek")), pk.len);
+    defer allocator.free(expected_pk);
+    const expected_sk = try acvpDecodeHex(allocator, try acvpString(try acvpField(expected, "dk")), sk.len);
+    defer allocator.free(expected_sk);
+    try std.testing.expectEqualSlices(u8, expected_pk, pk);
+    try std.testing.expectEqualSlices(u8, expected_sk, sk);
+}
+
+fn runAcvpMlKemEncapsulationVector(allocator: std.mem.Allocator, params: MlKem.Params, prompt: std.json.Value, expected: std.json.Value) !void {
+    const pk = try acvpDecodeHex(allocator, try acvpString(try acvpField(prompt, "ek")), MlKemSizes.publicKeyBytes(params));
+    defer allocator.free(pk);
+    var message = try acvpDecodeHex(allocator, try acvpString(try acvpField(prompt, "m")), 32);
+    defer secureZero(message);
+    defer allocator.free(message);
+
+    const ct = try allocator.alloc(u8, MlKemSizes.cipherTextBytes(params));
+    defer allocator.free(ct);
+    var shared: [32]u8 = undefined;
+    defer secureZero(&shared);
+    try MlKemKem.encapsulate(ct, &shared, pk, message[0..32], params);
+
+    const expected_ct = try acvpDecodeHex(allocator, try acvpString(try acvpField(expected, "c")), ct.len);
+    defer allocator.free(expected_ct);
+    const expected_shared = try acvpDecodeHex(allocator, try acvpString(try acvpField(expected, "k")), shared.len);
+    defer allocator.free(expected_shared);
+    try std.testing.expectEqualSlices(u8, expected_ct, ct);
+    try std.testing.expectEqualSlices(u8, expected_shared, &shared);
+}
+
+fn runAcvpMlKemDecapsulationVector(allocator: std.mem.Allocator, params: MlKem.Params, prompt: std.json.Value, expected: std.json.Value) !void {
+    const sk = try acvpDecodeHex(allocator, try acvpString(try acvpField(prompt, "dk")), MlKemSizes.secretKeyBytes(params));
+    defer allocator.free(sk);
+    const ct = try acvpDecodeHex(allocator, try acvpString(try acvpField(prompt, "c")), MlKemSizes.cipherTextBytes(params));
+    defer allocator.free(ct);
+
+    var shared: [32]u8 = undefined;
+    defer secureZero(&shared);
+    try MlKemKem.decapsulate(&shared, ct, sk, params);
+    const expected_shared = try acvpDecodeHex(allocator, try acvpString(try acvpField(expected, "k")), shared.len);
+    defer allocator.free(expected_shared);
+    try std.testing.expectEqualSlices(u8, expected_shared, &shared);
+}
+
+fn acvpMlKemParams(group: std.json.Value) !MlKem.Params {
+    return testMlKemParams(try acvpString(try acvpField(group, "parameterSet"))) orelse error.AcVpParameterSetUnsupported;
+}
+
 test "realized ML-KEM public size contracts" {
     const k512 = try Kem.sizes("ML-KEM-512");
     try std.testing.expectEqual(@as(usize, 800), k512.public_key);
@@ -62938,15 +63413,102 @@ test "realized ML-KEM-512 deterministic encapsulation round trip" {
     var ss_enc: [32]u8 = undefined;
     var ss_dec: [32]u8 = undefined;
 
-    try Kem.keypair("ML-KEM-512", &seed, &pk, &sk);
-    try Kem.encapsulate("ML-KEM-512", &coins, &pk, &ct, &ss_enc);
-    try Kem.decapsulate("ML-KEM-512", &sk, &ct, &ss_dec);
+    try testMlKemKeypair("ML-KEM-512", &seed, &pk, &sk);
+    try testMlKemEncapsulate("ML-KEM-512", &coins, &pk, &ct, &ss_enc);
+    try testMlKemDecapsulate("ML-KEM-512", &sk, &ct, &ss_dec);
     try std.testing.expect(ctEqual(&ss_enc, &ss_dec));
 
     ct[0] ^= 1;
     var rejected: [32]u8 = undefined;
-    try Kem.decapsulate("ML-KEM-512", &sk, &ct, &rejected);
+    try testMlKemDecapsulate("ML-KEM-512", &sk, &ct, &rejected);
     try std.testing.expect(!ctEqual(&ss_enc, &rejected));
+}
+
+test "ML-KEM-512 key generation matches official NIST ACVP FIPS 203 vector" {
+    // NIST ACVP-Server master, ML-KEM-keyGen-FIPS203: prompt.json blob
+    // 0d701155b53e0da51cfffebd81abc6deb5be4878 and expectedResults.json blob
+    // 883e318345b68382d09df05530c5209f4e509d54, group 1, test 1.
+    var seed: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(seed[0..32], "47B893474672BA92E4B12EE44FB32953AF8E8503B5FB471D1614FB8A021A660A");
+    _ = try std.fmt.hexToBytes(seed[32..64], "1F8CB39E9E30BC458A0DC5408884B1187FB217018DF760FA57317703B844A0A9");
+    var pk: [800]u8 = undefined;
+    var sk: [1632]u8 = undefined;
+    try testMlKemKeypair("ML-KEM-512", &seed, &pk, &sk);
+
+    var pk_hash: [32]u8 = undefined;
+    var sk_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&pk, &pk_hash, .{});
+    std.crypto.hash.sha2.Sha256.hash(&sk, &sk_hash, .{});
+    var expected_pk_hash: [32]u8 = undefined;
+    var expected_sk_hash: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&expected_pk_hash, "7e4a2b716a684c1ad33c43c808782da9e1a72f14ccda82723f712d49f53a9f28");
+    _ = try std.fmt.hexToBytes(&expected_sk_hash, "c725c25ca8636d75653a07e7a9ccf0b3c2b927617e8f99f0f05ab1f9cb7e046d");
+    try std.testing.expectEqualSlices(u8, &expected_pk_hash, &pk_hash);
+    try std.testing.expectEqualSlices(u8, &expected_sk_hash, &sk_hash);
+}
+
+test "official NIST ACVP FIPS 203 ML-KEM keygen and encapsulation vectors" {
+    const allocator = std.testing.allocator;
+    const keygen_prompt_bytes = @embedFile("vectors/ML-KEM-keyGen-prompt.json");
+    const keygen_expected_bytes = @embedFile("vectors/ML-KEM-keyGen-expectedResults.json");
+    const encap_prompt_bytes = @embedFile("vectors/ML-KEM-encapDecap-prompt.json");
+    const encap_expected_bytes = @embedFile("vectors/ML-KEM-encapDecap-expectedResults.json");
+    try expectAcvpFixtureDigest(keygen_prompt_bytes, "3f9ce34f6c836c77958bad2729e837c3b213f44ac36c3065976e7acca6389523");
+    try expectAcvpFixtureDigest(keygen_expected_bytes, "a253d0ad91c95ebea5b409673defef0aa49d65d4ed72286399e2e798ddf073a4");
+    try expectAcvpFixtureDigest(encap_prompt_bytes, "998e22dfb12efb14ce9fdff911ca634b13612819a1806f25da69adba7e16db91");
+    try expectAcvpFixtureDigest(encap_expected_bytes, "9089ec6ff2424da9f2782b89b2f831a329a3e28d6e5e24b802b78ff36ac61cdf");
+
+    const keygen_prompt = try std.json.parseFromSlice(std.json.Value, allocator, keygen_prompt_bytes, .{});
+    defer keygen_prompt.deinit();
+    const keygen_expected = try std.json.parseFromSlice(std.json.Value, allocator, keygen_expected_bytes, .{});
+    defer keygen_expected.deinit();
+
+    const keygen_prompt_groups = try acvpArray(try acvpField(keygen_prompt.value, "testGroups"));
+    const keygen_expected_groups = try acvpArray(try acvpField(keygen_expected.value, "testGroups"));
+    try std.testing.expectEqual(@as(usize, 3), keygen_prompt_groups.len);
+    try std.testing.expectEqual(keygen_prompt_groups.len, keygen_expected_groups.len);
+    for (keygen_prompt_groups, keygen_expected_groups) |prompt_group, expected_group| {
+        try std.testing.expectEqual(try acvpInteger(try acvpField(prompt_group, "tgId")), try acvpInteger(try acvpField(expected_group, "tgId")));
+        const params = try acvpMlKemParams(prompt_group);
+        const prompt_tests = try acvpArray(try acvpField(prompt_group, "tests"));
+        const expected_tests = try acvpArray(try acvpField(expected_group, "tests"));
+        try std.testing.expectEqual(@as(usize, 25), prompt_tests.len);
+        try std.testing.expectEqual(prompt_tests.len, expected_tests.len);
+        for (prompt_tests, expected_tests) |prompt, expected| {
+            try std.testing.expectEqual(try acvpInteger(try acvpField(prompt, "tcId")), try acvpInteger(try acvpField(expected, "tcId")));
+            try runAcvpMlKemKeygenVector(allocator, params, prompt, expected);
+        }
+    }
+
+    const encap_prompt = try std.json.parseFromSlice(std.json.Value, allocator, encap_prompt_bytes, .{});
+    defer encap_prompt.deinit();
+    const encap_expected = try std.json.parseFromSlice(std.json.Value, allocator, encap_expected_bytes, .{});
+    defer encap_expected.deinit();
+    const encap_prompt_groups = try acvpArray(try acvpField(encap_prompt.value, "testGroups"));
+    const encap_expected_groups = try acvpArray(try acvpField(encap_expected.value, "testGroups"));
+    try std.testing.expectEqual(@as(usize, 12), encap_prompt_groups.len);
+    try std.testing.expectEqual(encap_prompt_groups.len, encap_expected_groups.len);
+
+    // Groups 1–3 are encapsulation AFTs; groups 4–6 are decapsulation VALs.
+    // Key-check validation groups 7–12 remain outside this KEM implementation.
+    for (encap_prompt_groups[0..6], encap_expected_groups[0..6]) |prompt_group, expected_group| {
+        try std.testing.expectEqual(try acvpInteger(try acvpField(prompt_group, "tgId")), try acvpInteger(try acvpField(expected_group, "tgId")));
+        const params = try acvpMlKemParams(prompt_group);
+        const function = try acvpString(try acvpField(prompt_group, "function"));
+        const prompt_tests = try acvpArray(try acvpField(prompt_group, "tests"));
+        const expected_tests = try acvpArray(try acvpField(expected_group, "tests"));
+        try std.testing.expectEqual(prompt_tests.len, expected_tests.len);
+        for (prompt_tests, expected_tests) |prompt, expected| {
+            try std.testing.expectEqual(try acvpInteger(try acvpField(prompt, "tcId")), try acvpInteger(try acvpField(expected, "tcId")));
+            if (std.mem.eql(u8, function, "encapsulation")) {
+                try runAcvpMlKemEncapsulationVector(allocator, params, prompt, expected);
+            } else if (std.mem.eql(u8, function, "decapsulation")) {
+                try runAcvpMlKemDecapsulationVector(allocator, params, prompt, expected);
+            } else {
+                return error.AcVpFunctionUnsupported;
+            }
+        }
+    }
 }
 
 test "original Naza ML-KEM-1024 path is deterministic and rejects tampering" {
@@ -62959,20 +63521,30 @@ test "original Naza ML-KEM-1024 path is deterministic and rejects tampering" {
     var sk_a: [3168]u8 = undefined;
     var pk_b: [1568]u8 = undefined;
     var sk_b: [3168]u8 = undefined;
-    try Kem.keypair("ML-KEM-1024", &seed, &pk_a, &sk_a);
-    try Kem.keypair("ML-KEM-1024", &seed, &pk_b, &sk_b);
+    try testMlKemKeypair("ML-KEM-1024", &seed, &pk_a, &sk_a);
+    try testMlKemKeypair("ML-KEM-1024", &seed, &pk_b, &sk_b);
     try std.testing.expectEqualSlices(u8, &pk_a, &pk_b);
     try std.testing.expectEqualSlices(u8, &sk_a, &sk_b);
 
     var ct: [1568]u8 = undefined;
     var enc: [32]u8 = undefined;
     var dec: [32]u8 = undefined;
-    try Kem.encapsulate("ML-KEM-1024", &coins, &pk_a, &ct, &enc);
-    try Kem.decapsulate("ML-KEM-1024", &sk_a, &ct, &dec);
+    try testMlKemEncapsulate("ML-KEM-1024", &coins, &pk_a, &ct, &enc);
+    try testMlKemDecapsulate("ML-KEM-1024", &sk_a, &ct, &dec);
     try std.testing.expectEqualSlices(u8, &enc, &dec);
     ct[ct.len - 1] ^= 0x80;
-    try Kem.decapsulate("ML-KEM-1024", &sk_a, &ct, &dec);
+    try testMlKemDecapsulate("ML-KEM-1024", &sk_a, &ct, &dec);
     try std.testing.expect(!ctEqual(&enc, &dec));
+}
+
+test "unverified ML-KEM public dispatch fails closed" {
+    var empty: [0]u8 = .{};
+    try std.testing.expectError(error.AlgorithmNotCallable, Kem.keypair("ML-KEM-1024", "", &empty, &empty));
+    try std.testing.expectError(error.AlgorithmNotCallable, Kem.encapsulate("ML-KEM-1024", "", "", &empty, &empty));
+    try std.testing.expectError(error.AlgorithmNotCallable, Kem.decapsulate("ML-KEM-1024", "", "", &empty));
+    try std.testing.expect(!pqcCallable("ML-KEM-512"));
+    try std.testing.expect(!pqcCallable("ML-KEM-768"));
+    try std.testing.expect(!pqcCallable("ML-KEM-1024"));
 }
 
 test "ML-DSA facade fails closed pending interoperability" {
@@ -62986,7 +63558,7 @@ test "ML-DSA facade fails closed pending interoperability" {
 }
 
 test "realized catalog separates callable from catalog-only" {
-    try std.testing.expect(pqcCallable("ML-KEM-1024"));
+    try std.testing.expect(!pqcCallable("ML-KEM-1024"));
     try std.testing.expect(!pqcCallable("ML-DSA-87"));
     try std.testing.expect(!pqcCallable("Classic-McEliece"));
     try std.testing.expect(!pqcUsable("ML-KEM-1024"));
