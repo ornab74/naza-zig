@@ -18,6 +18,35 @@ Pure-Zig NAZA terminal UI with secure GGUF handling, crypto utilities, and fast 
 - Quantized matrix worker pool
 - Fused Q3_K dot-product kernel
 
+## Post-quantum crypto
+
+NAZA's standards-facing PQC path uses Zig 0.15.2's `std.crypto.kem.ml_kem`
+implementation of NIST FIPS 203. The isolated test harness exercises
+ML-KEM-512, ML-KEM-768, and ML-KEM-1024, including key serialization and
+implicit-rejection behavior.
+
+The application-facing session profile in `src/pqc/session.zig` currently uses
+ML-KEM-768. It never exposes the raw KEM shared secret to callers. Instead it
+derives a 32-byte session key with SHA3-256 over a NAZA domain-separation label,
+a NAZA-local algorithm identifier, caller-supplied protocol context, and the
+ML-KEM shared secret. Different contexts therefore derive different application
+keys from the same KEM secret.
+
+Algorithm identifier `1` means `ML-KEM-768` only inside the NAZA protocol. It is
+not an assigned NIST, IANA, TLS, HPKE, or other standards-registry code point.
+
+The session profile is a key-establishment layer. It does not by itself provide
+message encryption, signatures, peer authentication, replay protection, or a
+complete network handshake. Those properties must be supplied by the protocol
+that consumes the derived session key.
+
+Run the isolated PQC tests without depending on the monolithic application:
+
+```bash
+zig build pqc-test
+zig build pqc-selftest
+```
+
 ## Build
 
 ```bash
