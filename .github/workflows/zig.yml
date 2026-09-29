@@ -25,7 +25,8 @@ jobs:
           chmod -R go-w "$install_dir"
           "$install_dir/zig" version
           printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
-      - run: zig fmt --check build.zig src/naza_all.zig
+      - run: zig fmt --check build.zig src/naza_all.zig src/pqc_selftest.zig
       - run: zig build
       - run: zig build test
+      - run: zig build pqc-selftest
       - run: zig build run -- selftest
