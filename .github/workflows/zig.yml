@@ -30,7 +30,7 @@ jobs:
       # monolith gates. The current main branch has an existing fmt failure in
       # src/naza_all.zig, so this ordering keeps PQC regressions independently
       # observable without weakening that legacy check.
-      - run: zig fmt --check src/pqc_selftest.zig
+      - run: zig fmt --check src/pqc_selftest.zig src/pqc/session.zig
       - run: zig build pqc-test
       - run: zig build pqc-selftest
 
