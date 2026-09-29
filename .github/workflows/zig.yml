@@ -25,8 +25,16 @@ jobs:
           chmod -R go-w "$install_dir"
           "$install_dir/zig" version
           printf '%s\n' "$install_dir" >> "$GITHUB_PATH"
-      - run: zig fmt --check build.zig src/naza_all.zig src/pqc_selftest.zig
+
+      # Validate the isolated standards-facing PQC path before the legacy
+      # monolith gates. The current main branch has an existing fmt failure in
+      # src/naza_all.zig, so this ordering keeps PQC regressions independently
+      # observable without weakening that legacy check.
+      - run: zig fmt --check src/pqc_selftest.zig
+      - run: zig build pqc-test
+      - run: zig build pqc-selftest
+
+      - run: zig fmt --check build.zig src/naza_all.zig
       - run: zig build
       - run: zig build test
-      - run: zig build pqc-selftest
       - run: zig build run -- selftest
