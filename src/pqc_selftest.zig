@@ -1,4 +1,5 @@
 const std = @import("std");
+const session = @import("pqc/session.zig");
 
 const ml_kem = std.crypto.kem.ml_kem;
 
@@ -6,6 +7,8 @@ const SelfTestError = error{
     SharedSecretMismatch,
     SerializationRoundTripMismatch,
     ImplicitRejectionFailed,
+    SessionKeyMismatch,
+    ContextSeparationFailed,
 };
 
 fn exerciseKem(comptime Kem: type, verbose: bool) !void {
@@ -57,16 +60,43 @@ fn exerciseKem(comptime Kem: type, verbose: bool) !void {
     }
 }
 
+fn exerciseSession(verbose: bool) !void {
+    const key_pair = session.generateKeyPair();
+    const context = "naza:pqc-selftest:session-v1";
+    const initiator = session.encapsulate(key_pair.public_key, context);
+    const responder = try session.decapsulate(key_pair.secret_key, &initiator.ciphertext, context);
+    if (!std.mem.eql(u8, &initiator.session_key, &responder)) {
+        return SelfTestError.SessionKeyMismatch;
+    }
+
+    const other_context_key = try session.decapsulate(
+        key_pair.secret_key,
+        &initiator.ciphertext,
+        "naza:pqc-selftest:different-context",
+    );
+    if (std.mem.eql(u8, &initiator.session_key, &other_context_key)) {
+        return SelfTestError.ContextSeparationFailed;
+    }
+
+    if (verbose) {
+        std.debug.print(
+            "NAZA session profile: {s}, algorithm-id={} [agreement + context separation: OK]\n",
+            .{ session.Kem.name, @intFromEnum(session.algorithm) },
+        );
+    }
+}
+
 pub fn runAll(verbose: bool) !void {
     try exerciseKem(ml_kem.MLKem512, verbose);
     try exerciseKem(ml_kem.MLKem768, verbose);
     try exerciseKem(ml_kem.MLKem1024, verbose);
+    try exerciseSession(verbose);
 }
 
 pub fn main() !void {
     std.debug.print("NAZA FIPS-203 ML-KEM self-test\n", .{});
     try runAll(true);
-    std.debug.print("All ML-KEM parameter sets passed.\n", .{});
+    std.debug.print("All ML-KEM parameter sets and the NAZA session profile passed.\n", .{});
 }
 
 test "FIPS-203 ML-KEM-512" {
@@ -79,4 +109,8 @@ test "FIPS-203 ML-KEM-768" {
 
 test "FIPS-203 ML-KEM-1024" {
     try exerciseKem(ml_kem.MLKem1024, false);
+}
+
+test "NAZA ML-KEM-768 session profile" {
+    try exerciseSession(false);
 }
