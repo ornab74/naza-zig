@@ -6,6 +6,7 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 pub const key_length = Aes256Gcm.key_length;
 pub const nonce_length = Aes256Gcm.nonce_length;
 pub const tag_length = Aes256Gcm.tag_length;
+pub const framing_overhead = nonce_length + tag_length;
 pub const pbkdf2_salt_length: usize = 16;
 pub const pbkdf2_rounds: u32 = 200_000;
 
@@ -46,7 +47,7 @@ pub fn encryptWithNonceAlloc(
     key: Key,
     nonce: Nonce,
 ) ![]u8 {
-    const total_len = nonce_length + plaintext.len + tag_length;
+    const total_len = framing_overhead + plaintext.len;
     const out = try allocator.alloc(u8, total_len);
     errdefer allocator.free(out);
 
@@ -64,7 +65,7 @@ pub fn encryptWithNonceAlloc(
 /// Authentication failures are returned as `error.AuthenticationFailed` by
 /// Zig's AES-GCM implementation.
 pub fn decryptAlloc(allocator: std.mem.Allocator, framed: []const u8, key: Key) ![]u8 {
-    if (framed.len < nonce_length + tag_length) return Error.InvalidCiphertext;
+    if (framed.len < framing_overhead) return Error.InvalidCiphertext;
 
     const nonce: Nonce = framed[0..nonce_length].*;
     const ciphertext = framed[nonce_length .. framed.len - tag_length];
@@ -101,7 +102,9 @@ pub fn deriveKeyFromPassphrase(passphrase: []const u8, salt: Salt) !Key {
 /// Produce the exact file payload used by the Python passphrase path:
 /// `salt || derived_key` (48 bytes total).
 pub fn deriveStoredPassphraseKey(passphrase: []const u8, salt: Salt) !StoredPassphraseKey {
-    const key = try deriveKeyFromPassphrase(passphrase, salt);
+    var key = try deriveKeyFromPassphrase(passphrase, salt);
+    defer std.crypto.secureZero(u8, &key);
+
     var stored: StoredPassphraseKey = undefined;
     @memcpy(stored[0..pbkdf2_salt_length], &salt);
     @memcpy(stored[pbkdf2_salt_length..], &key);
@@ -123,7 +126,7 @@ test "AES-GCM framing round trip matches Python layout" {
     const framed = try encryptWithNonceAlloc(allocator, plaintext, key, nonce);
     defer allocator.free(framed);
 
-    try std.testing.expectEqual(@as(usize, nonce_length + plaintext.len + tag_length), framed.len);
+    try std.testing.expectEqual(@as(usize, framing_overhead + plaintext.len), framed.len);
     try std.testing.expectEqualSlices(u8, &nonce, framed[0..nonce_length]);
 
     const expected_ciphertext = [_]u8{
@@ -148,6 +151,27 @@ test "AES-GCM framing round trip matches Python layout" {
     try std.testing.expectEqualSlices(u8, plaintext, recovered);
 }
 
+test "AES-GCM supports empty plaintext with Python-compatible framing" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x69} ** key_length;
+    const nonce = [_]u8{0x42} ** nonce_length;
+
+    const framed = try encryptWithNonceAlloc(allocator, "", key, nonce);
+    defer allocator.free(framed);
+    try std.testing.expectEqual(@as(usize, framing_overhead), framed.len);
+
+    const recovered = try decryptAlloc(allocator, framed, key);
+    defer allocator.free(recovered);
+    try std.testing.expectEqual(@as(usize, 0), recovered.len);
+}
+
+test "AES-GCM rejects truncated framing before parsing" {
+    const allocator = std.testing.allocator;
+    const key = generateKey();
+    var short: [framing_overhead - 1]u8 = [_]u8{0} ** (framing_overhead - 1);
+    try std.testing.expectError(Error.InvalidCiphertext, decryptAlloc(allocator, &short, key));
+}
+
 test "AES-GCM rejects modified authentication tag" {
     const allocator = std.testing.allocator;
     const key = generateKey();
@@ -156,6 +180,39 @@ test "AES-GCM rejects modified authentication tag" {
 
     framed[framed.len - 1] ^= 0x01;
     try std.testing.expectError(error.AuthenticationFailed, decryptAlloc(allocator, framed, key));
+}
+
+test "AES-GCM rejects modified ciphertext" {
+    const allocator = std.testing.allocator;
+    const key = generateKey();
+    const framed = try encryptAlloc(allocator, "authenticated payload", key);
+    defer allocator.free(framed);
+
+    framed[nonce_length] ^= 0x01;
+    try std.testing.expectError(error.AuthenticationFailed, decryptAlloc(allocator, framed, key));
+}
+
+test "AES-GCM rejects the wrong key" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x11} ** key_length;
+    const wrong_key = [_]u8{0x22} ** key_length;
+    const framed = try encryptAlloc(allocator, "authenticated payload", key);
+    defer allocator.free(framed);
+
+    try std.testing.expectError(error.AuthenticationFailed, decryptAlloc(allocator, framed, wrong_key));
+}
+
+test "stored key parser preserves Python compatibility rules" {
+    var raw: [key_length]u8 = [_]u8{0xa5} ** key_length;
+    try std.testing.expectEqualSlices(u8, &raw, &(try keyFromStoredBytes(&raw)));
+
+    var stored: StoredPassphraseKey = undefined;
+    @memset(stored[0..pbkdf2_salt_length], 0x5a);
+    @memset(stored[pbkdf2_salt_length..], 0xa5);
+    try std.testing.expectEqualSlices(u8, &raw, &(try keyFromStoredBytes(&stored)));
+
+    var too_short: [key_length - 1]u8 = [_]u8{0} ** (key_length - 1);
+    try std.testing.expectError(Error.KeyTooShort, keyFromStoredBytes(&too_short));
 }
 
 test "PBKDF2-HMAC-SHA256 matches Python cryptography parameters" {
