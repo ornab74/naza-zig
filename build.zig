@@ -41,6 +41,39 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run monolith tests");
+
+    // Keep the standards-facing PQC harness isolated from the monolith. This
+    // makes it cheap to run in CI and prevents unrelated model/TUI changes
+    // from hiding ML-KEM regressions.
+    const pqc_module = b.createModule(.{
+        .root_source_file = b.path("src/pqc_selftest.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pqc_exe = b.addExecutable(.{
+        .name = "naza-pqc-selftest",
+        .root_module = pqc_module,
+    });
+    b.installArtifact(pqc_exe);
+
+    const pqc_run_step = b.step("pqc-selftest", "Run FIPS-203 ML-KEM self-tests");
+    const pqc_run = b.addRunArtifact(pqc_exe);
+    pqc_run.stdio = .inherit;
+    pqc_run_step.dependOn(&pqc_run.step);
+
+    const pqc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pqc_selftest.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_pqc_tests = b.addRunArtifact(pqc_tests);
+
+    const pqc_test_step = b.step("pqc-test", "Run FIPS-203 ML-KEM test suite");
+    pqc_test_step.dependOn(&run_pqc_tests.step);
+
+    const test_step = b.step("test", "Run monolith and PQC tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_pqc_tests.step);
 }
