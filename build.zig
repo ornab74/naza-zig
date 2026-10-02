@@ -41,6 +41,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run monolith tests");
+
+    const aes_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/crypto/aes_gcm.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_aes_tests = b.addRunArtifact(aes_tests);
+
+    const aes_test_step = b.step("aes-test", "Run AES-256-GCM/PBKDF2 compatibility tests");
+    aes_test_step.dependOn(&run_aes_tests.step);
+
+    const test_step = b.step("test", "Run monolith and AES-GCM tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_aes_tests.step);
 }
